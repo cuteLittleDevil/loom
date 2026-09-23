@@ -32,7 +32,8 @@ type Pool struct {
 	onAlert   func(Alert)
 	interval  time.Duration
 
-	// operationFuncChan 无缓冲。调用方等到协调者做完这一次操作。
+	// operationFuncChan 缓冲 operationBuffer。
+	// Submit 能放进缓冲就直接返回；放不下才另开协程阻塞发送。
 	operationFuncChan chan operationFunc
 }
 
@@ -57,7 +58,7 @@ func New(cfg Config) (*Pool, error) {
 		size:              cfg.Size,
 		threshold:         threshold,
 		onAlert:           cfg.OnAlert,
-		operationFuncChan: make(chan operationFunc),
+		operationFuncChan: make(chan operationFunc, operationBuffer),
 	}
 	if alerts {
 		p.interval = min(threshold, time.Second)
@@ -105,7 +106,7 @@ func (p *Pool) Submit[R any](fn func() (R, error), opts ...Option) <-chan Result
 		deliverNow(ch, Result[R]{Value: value, Snapshot: snap, Err: job.err})
 	}
 
-	p.operate(func(st *sched) {
+	p.enqueue(func(st *sched) {
 		st.accept(job, time.Now())
 	})
 	return ch

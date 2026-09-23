@@ -6,6 +6,9 @@ import (
 	"time"
 )
 
+// operationBuffer 是交给协调者的操作缓冲。未满时 Submit 不另开协程。
+const operationBuffer = 100
+
 // operationFunc 只在协调者协程里执行。协调者之外不读写 sched。
 type operationFunc func(st *sched)
 
@@ -14,11 +17,9 @@ type sched struct {
 	size      int
 	threshold time.Duration
 
-	nextID   uint64
-	idle     int
-	runningN int
-	waitingN int
+	nextID uint64
 	// submitted、completed、failed、alerted 只在这一个协调者里累加。
+	// Idle、Running、Waiting 不另记，快照时从 running 和 queue 算。
 	submitted uint64
 	completed uint64
 	failed    uint64
@@ -29,17 +30,16 @@ type sched struct {
 	running   map[uint64]*task
 
 	// ready 里的任务已经标成 Running，但要等当前任务把 Result 送出后才启动。
+	// 多个任务可以先后 finish、尚未 release，所以这里要留住一串。
 	ready []*task
-	// launch 里的任务在本次操作返回后由协调者启动。
-	launch     []*task
-	goroutines int
+	// launch 是本次操作结束后要启动的那一个任务。每次操作最多产生一个。
+	launch *task
 }
 
 func newSched(p *Pool) *sched {
 	return &sched{
 		size:      p.size,
 		threshold: p.threshold,
-		idle:      p.size,
 		nextID:    1,
 		waitCount: make(map[int]int),
 		running:   make(map[uint64]*task),
@@ -51,11 +51,24 @@ func (p *Pool) run() {
 	st := newSched(p)
 	for op := range p.operationFuncChan {
 		op(st)
-		p.startTasks(st)
+		p.startTask(st)
+	}
+}
+
+// enqueue 把操作放进协调者的缓冲。缓冲满时另开协程，由那条协程阻塞发送。
+// 调用方不等待协调者执行完。
+func (p *Pool) enqueue(fn operationFunc) {
+	select {
+	case p.operationFuncChan <- fn:
+	default:
+		go func() {
+			p.operationFuncChan <- fn
+		}()
 	}
 }
 
 // operate 把操作交给协调者并等它执行完。
+// finish、release 和告警采集要用结果，所以仍然等待。
 func (p *Pool) operate(fn operationFunc) {
 	done := make(chan struct{})
 	p.operationFuncChan <- func(st *sched) {
@@ -65,14 +78,15 @@ func (p *Pool) operate(fn operationFunc) {
 	<-done
 }
 
-// startTasks 在协调者上启动任务协程。调用时协调者不在接收操作，
+// startTask 在协调者上启动这一个任务协程。调用时协调者不在接收操作，
 // 新协程若立刻回来发送，会堵住直到本轮操作结束，不会和当前操作重入。
-func (p *Pool) startTasks(st *sched) {
-	jobs := st.launch
-	st.launch = nil
-	for _, job := range jobs {
-		go p.execute(job)
+func (p *Pool) startTask(st *sched) {
+	job := st.launch
+	if job == nil {
+		return
 	}
+	st.launch = nil
+	go p.execute(job)
 }
 
 // accept 在协调者里接受任务。
@@ -81,67 +95,66 @@ func (st *sched) accept(job *task, now time.Time) {
 	job.id = st.nextID
 	st.nextID++
 	st.submitted++
-	if st.idle > 0 {
-		st.idle--
+	if len(st.running) < st.size {
 		st.markRunning(job, now)
-		st.launch = append(st.launch, job)
-		st.goroutines++
+		st.launch = job
 		return
 	}
 	heap.Push(&st.queue, job)
-	st.waitingN++
 	st.waitCount[job.priority]++
 }
 
 // finish 在协调者里计入终态、把下一个排队任务标成 Running，并复制快照。
-// 队列非空时不增加 Idle。任务协程要等 release 才真正启动下一个用户函数。
+// 队列非空时运行表长度不变，快照里的 Idle 不会变多。任务协程要等 release 才真正启动下一个用户函数。
 func (st *sched) finish(job *task, now time.Time) Snapshot {
 	delete(st.running, job.id)
-	st.runningN--
 	st.completed++
 	if job.err != nil {
 		st.failed++
 	}
 	if st.queue.Len() > 0 {
 		next := heap.Pop(&st.queue).(*task)
-		st.waitingN--
 		st.waitCount[next.priority]--
 		if st.waitCount[next.priority] == 0 {
 			delete(st.waitCount, next.priority)
 		}
 		st.markRunning(next, now)
 		st.ready = append(st.ready, next)
-	} else {
-		st.idle++
 	}
 	return st.snapshot(now)
 }
 
 // release 在 Result 已经送出后调用。这时才让协调者启动下一个任务协程。
 func (st *sched) release() {
-	st.goroutines--
-	if len(st.ready) > 0 {
-		next := st.ready[0]
-		st.ready[0] = nil
-		st.ready = st.ready[1:]
-		st.launch = append(st.launch, next)
-		st.goroutines++
+	if len(st.ready) == 0 {
+		return
 	}
+	next := st.ready[0]
+	st.ready[0] = nil
+	st.ready = st.ready[1:]
+	st.launch = next
 }
 
 func (st *sched) markRunning(job *task, now time.Time) {
 	job.started = now
 	job.waitingFor = now.Sub(job.accepted)
-	st.runningN++
 	st.running[job.id] = job
 }
 
+func (st *sched) counts() (idle, running, waiting int) {
+	running = len(st.running)
+	waiting = st.queue.Len()
+	idle = st.size - running
+	return
+}
+
 func (st *sched) snapshot(now time.Time) Snapshot {
+	idle, running, waiting := st.counts()
 	snap := Snapshot{
 		Size:      st.size,
-		Idle:      st.idle,
-		Running:   st.runningN,
-		Waiting:   st.waitingN,
+		Idle:      idle,
+		Running:   running,
+		Waiting:   waiting,
 		Submitted: st.submitted,
 		Completed: st.completed,
 		Failed:    st.failed,

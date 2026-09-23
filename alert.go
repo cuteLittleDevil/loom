@@ -40,6 +40,7 @@ func (st *sched) collectAlerts(now time.Time) []Alert {
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].id < jobs[j].id })
 
+	idle, running, waiting := st.counts()
 	var alerts []Alert
 	for _, job := range jobs {
 		elapsed := now.Sub(job.started)
@@ -54,9 +55,9 @@ func (st *sched) collectAlerts(now time.Time) []Alert {
 			TaskID:     job.id,
 			Priority:   job.priority,
 			RunningFor: elapsed,
-			Idle:       st.idle,
-			Running:    st.runningN,
-			Waiting:    st.waitingN,
+			Idle:       idle,
+			Running:    running,
+			Waiting:    waiting,
 			At:         now,
 		})
 	}
