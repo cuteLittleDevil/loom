@@ -22,15 +22,9 @@ type task struct {
 func (p *Pool) execute(job *task) {
 	job.exec()
 	var snap Snapshot
-	if !p.operate(func(st *sched) {
+	p.operate(func(st *sched) {
 		snap = st.finish(job, time.Now())
-	}) {
-		if term := p.terminal.Load(); term != nil {
-			snap = *term
-		}
-		job.deliver(snap)
-		return
-	}
+	})
 	job.deliver(snap)
 	p.operate(func(st *sched) {
 		st.release()

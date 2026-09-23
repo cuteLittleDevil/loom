@@ -7,7 +7,6 @@ package loom
 import (
 	"fmt"
 	"runtime/debug"
-	"sync/atomic"
 	"time"
 )
 
@@ -19,7 +18,7 @@ type Config struct {
 	// 零值按 30s 处理；负值不启动巡检。
 	OccupyThreshold time.Duration
 	// OnAlert 在协调者之外调用，可以为 nil。
-	// 为 nil 时仍然更新告警计数。回调里不要同步等待 Close，也不要在用户函数里同步接收本池的 channel。
+	// 为 nil 时仍然更新告警计数。不要在用户函数里同步接收本池的 channel。
 	OnAlert func(Alert)
 }
 
@@ -33,18 +32,8 @@ type Pool struct {
 	onAlert   func(Alert)
 	interval  time.Duration
 
-	// operationFuncChan 无缓冲。协调者退出前会把已提交的操作收完；
-	// 发送和退出在同一条通道上会合，退出后不会再有操作留在缓冲里。
+	// operationFuncChan 无缓冲。调用方等到协调者做完这一次操作。
 	operationFuncChan chan operationFunc
-	wake              chan struct{}
-	exited            chan struct{}
-
-	// terminal 在协调者发布最终快照之后非 nil。之后的 Submit 直接读它。
-	terminal atomic.Pointer[Snapshot]
-	// pending 是已承诺要发给协调者、协调者尚未处理完的操作数。
-	pending atomic.Int32
-
-	inspectWake chan struct{}
 }
 
 // noCopy 让 go vet 拒绝复制 Pool。Lock 和 Unlock 是 vet 的标记，运行时不会加锁。
@@ -69,38 +58,15 @@ func New(cfg Config) (*Pool, error) {
 		threshold:         threshold,
 		onAlert:           cfg.OnAlert,
 		operationFuncChan: make(chan operationFunc),
-		wake:              make(chan struct{}, 1),
-		exited:            make(chan struct{}),
 	}
 	if alerts {
 		p.interval = min(threshold, time.Second)
-		p.inspectWake = make(chan struct{}, 1)
 	}
 	go p.run()
 	if alerts {
 		go p.inspect()
 	}
 	return p, nil
-}
-
-// Close 拒绝后续提交，并等待已接受的任务终态、结果送出、任务协程和巡检退出。
-// 同一个池上多次或并发调用，等的是同一次排空，结束后返回 nil。
-// p == nil 时返回 ErrNilPool。
-func (p *Pool) Close() error {
-	if p == nil {
-		return ErrNilPool
-	}
-	if p.terminal.Load() != nil {
-		return nil
-	}
-	waiter := make(chan struct{})
-	if !p.operate(func(st *sched) {
-		st.addClose(waiter)
-	}) {
-		return nil
-	}
-	<-waiter
-	return nil
 }
 
 // Submit 接受 fn 并立刻返回 channel。R 由 fn 推断。
@@ -139,20 +105,9 @@ func (p *Pool) Submit[R any](fn func() (R, error), opts ...Option) <-chan Result
 		deliverNow(ch, Result[R]{Value: value, Snapshot: snap, Err: job.err})
 	}
 
-	var snap Snapshot
-	var rejected bool
-	if !p.operate(func(st *sched) {
-		snap, rejected = st.accept(job, time.Now())
-	}) {
-		if term := p.terminal.Load(); term != nil {
-			snap = *term
-		}
-		deliverNow(ch, Result[R]{Snapshot: snap, Err: ErrClosed})
-		return ch
-	}
-	if rejected {
-		deliverNow(ch, Result[R]{Snapshot: snap, Err: ErrClosed})
-	}
+	p.operate(func(st *sched) {
+		st.accept(job, time.Now())
+	})
 	return ch
 }
 

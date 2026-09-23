@@ -8,40 +8,19 @@ import (
 func (p *Pool) inspect() {
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			if !p.emitAlerts() {
-				return
-			}
-		case <-p.inspectWake:
-		}
-		var done bool
-		if !p.operate(func(st *sched) {
-			done = st.closed && st.runningN == 0 && st.waitingN == 0
-		}) {
-			return
-		}
-		if done {
-			p.operate(func(st *sched) {
-				st.inspectorOut = true
-				st.maybeCompleteClose()
-			})
-			return
-		}
+	for range ticker.C {
+		p.emitAlerts()
 	}
 }
 
 // emitAlerts 让协调者合并跨过的周期，再按任务 ID 顺序调用 OnAlert。
-func (p *Pool) emitAlerts() bool {
+func (p *Pool) emitAlerts() {
 	var alerts []Alert
-	if !p.operate(func(st *sched) {
+	p.operate(func(st *sched) {
 		alerts = st.collectAlerts(time.Now())
-	}) {
-		return false
-	}
+	})
 	if p.onAlert == nil {
-		return true
+		return
 	}
 	for _, alert := range alerts {
 		func() {
@@ -49,7 +28,6 @@ func (p *Pool) emitAlerts() bool {
 			p.onAlert(alert)
 		}()
 	}
-	return true
 }
 
 func (st *sched) collectAlerts(now time.Time) []Alert {
@@ -83,14 +61,4 @@ func (st *sched) collectAlerts(now time.Time) []Alert {
 		})
 	}
 	return alerts
-}
-
-func (p *Pool) wakeInspector() {
-	if p.inspectWake == nil {
-		return
-	}
-	select {
-	case p.inspectWake <- struct{}{}:
-	default:
-	}
 }

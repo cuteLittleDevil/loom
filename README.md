@@ -9,7 +9,6 @@ p, err := loom.New(loom.Config{Size: 8})
 if err != nil {
     return err
 }
-defer p.Close()
 
 ch := p.Submit(func() (string, error) {
     return "ok", nil

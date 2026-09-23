@@ -11,12 +11,9 @@ type operationFunc func(st *sched)
 
 // sched 只存在于协调者协程。running 是唯一的任务表。
 type sched struct {
-	size       int
-	threshold  time.Duration
-	inspecting bool
+	size      int
+	threshold time.Duration
 
-	closed   bool
-	wantExit bool
 	nextID   uint64
 	idle     int
 	runningN int
@@ -36,85 +33,36 @@ type sched struct {
 	// launch 里的任务在本次操作返回后由协调者启动。
 	launch     []*task
 	goroutines int
-
-	inspectorOut bool
-	closeWaiters []chan struct{}
-
-	pool *Pool
 }
 
 func newSched(p *Pool) *sched {
 	return &sched{
-		size:       p.size,
-		threshold:  p.threshold,
-		inspecting: p.inspectWake != nil,
-		idle:       p.size,
-		nextID:     1,
-		waitCount:  make(map[int]int),
-		running:    make(map[uint64]*task),
-		pool:       p,
+		size:      p.size,
+		threshold: p.threshold,
+		idle:      p.size,
+		nextID:    1,
+		waitCount: make(map[int]int),
+		running:   make(map[uint64]*task),
 	}
 }
 
 // run 是协调者。running 和全部计数只在这里读写。
 func (p *Pool) run() {
 	st := newSched(p)
-	defer close(p.exited)
-	for {
-		op, ok := p.nextOp()
-		if !ok {
-			return
-		}
+	for op := range p.operationFuncChan {
 		op(st)
 		p.startTasks(st)
-		p.pending.Add(-1)
 	}
 }
 
-func (p *Pool) nextOp() (operationFunc, bool) {
-	for {
-		if p.terminal.Load() != nil && p.pending.Load() == 0 {
-			return nil, false
-		}
-		select {
-		case op := <-p.operationFuncChan:
-			return op, true
-		case <-p.wake:
-		}
-	}
-}
-
-// operate 把操作交给协调者并等它执行完。协调者已经退出时返回 false。
-func (p *Pool) operate(fn operationFunc) bool {
-	if p.terminal.Load() != nil {
-		return false
-	}
-	p.pending.Add(1)
-	if p.terminal.Load() != nil {
-		p.dropPending()
-		return false
-	}
+// operate 把操作交给协调者并等它执行完。
+func (p *Pool) operate(fn operationFunc) {
 	done := make(chan struct{})
-	select {
-	case p.operationFuncChan <- func(st *sched) {
+	p.operationFuncChan <- func(st *sched) {
 		defer close(done)
 		fn(st)
-	}:
-		<-done
-		return true
-	case <-p.exited:
-		p.dropPending()
-		return false
 	}
-}
-
-func (p *Pool) dropPending() {
-	if p.pending.Add(-1) == 0 {
-		select {
-		case p.wake <- struct{}{}:
-		default:
-		}
-	}
+	<-done
 }
 
 // startTasks 在协调者上启动任务协程。调用时协调者不在接收操作，
@@ -127,46 +75,8 @@ func (p *Pool) startTasks(st *sched) {
 	}
 }
 
-func (st *sched) addClose(waiter chan struct{}) {
-	if st.wantExit {
-		close(waiter)
-		return
-	}
-	if !st.closed {
-		st.closed = true
-		st.pool.wakeInspector()
-	}
-	st.closeWaiters = append(st.closeWaiters, waiter)
-	st.maybeCompleteClose()
-}
-
-// maybeCompleteClose 在任务都已送出结果、巡检也已退出时发布最终快照。
-// 最终快照先于关闭等待通道发布，Close 返回之后的 Submit 读到的 Idle 是 0。
-func (st *sched) maybeCompleteClose() {
-	if st.wantExit || !st.closed {
-		return
-	}
-	if st.runningN != 0 || st.waitingN != 0 || st.goroutines != 0 {
-		return
-	}
-	if st.inspecting && !st.inspectorOut {
-		return
-	}
-	st.idle = 0
-	st.wantExit = true
-	snap := st.snapshot(time.Now())
-	st.pool.terminal.Store(&snap)
-	for _, waiter := range st.closeWaiters {
-		close(waiter)
-	}
-	st.closeWaiters = nil
-}
-
-// accept 在协调者里接受任务，或在已关闭时返回实况快照。
-func (st *sched) accept(job *task, now time.Time) (Snapshot, bool) {
-	if st.closed {
-		return st.snapshot(now), true
-	}
+// accept 在协调者里接受任务。
+func (st *sched) accept(job *task, now time.Time) {
 	job.accepted = now
 	job.id = st.nextID
 	st.nextID++
@@ -176,12 +86,11 @@ func (st *sched) accept(job *task, now time.Time) (Snapshot, bool) {
 		st.markRunning(job, now)
 		st.launch = append(st.launch, job)
 		st.goroutines++
-		return Snapshot{}, false
+		return
 	}
 	heap.Push(&st.queue, job)
 	st.waitingN++
 	st.waitCount[job.priority]++
-	return Snapshot{}, false
 }
 
 // finish 在协调者里计入终态、把下一个排队任务标成 Running，并复制快照。
@@ -205,9 +114,6 @@ func (st *sched) finish(job *task, now time.Time) Snapshot {
 	} else {
 		st.idle++
 	}
-	if st.closed && st.runningN == 0 && st.waitingN == 0 {
-		st.pool.wakeInspector()
-	}
 	return st.snapshot(now)
 }
 
@@ -221,7 +127,6 @@ func (st *sched) release() {
 		st.launch = append(st.launch, next)
 		st.goroutines++
 	}
-	st.maybeCompleteClose()
 }
 
 func (st *sched) markRunning(job *task, now time.Time) {

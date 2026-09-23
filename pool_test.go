@@ -2,6 +2,7 @@ package loom_test
 
 import (
 	"errors"
+	"fmt"
 	"runtime"
 	"slices"
 	"sync"
@@ -18,11 +19,6 @@ func mustPool(t *testing.T, cfg loom.Config) *loom.Pool {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() {
-		if err := p.Close(); err != nil {
-			t.Errorf("Close: %v", err)
-		}
-	})
 	return p
 }
 
@@ -91,9 +87,16 @@ func TestSubmitReturnsBeforeFnDone(t *testing.T) {
 
 func TestUnreadResultDoesNotBlockWorker(t *testing.T) {
 	p := mustPool(t, loom.Config{Size: 1, OccupyThreshold: -1})
-	p.Submit(func() (int, error) { return 1, nil })
-	ch := p.Submit(func() (int, error) { return 2, nil })
+	p.Submit(func() (int, error) {
+		return 1, nil
+	})
+	ch := p.Submit(func() (int, error) {
+		time.Sleep(1 * time.Second)
+		return 2, nil
+	})
+	fmt.Println(time.Now(), "1")
 	got := recv(t, ch)
+	fmt.Println(time.Now(), "2")
 	if got.Value != 2 || got.Err != nil {
 		t.Fatalf("value=%d err=%v", got.Value, got.Err)
 	}
@@ -262,9 +265,6 @@ func TestNilRejectsDoNotTouchCounters(t *testing.T) {
 
 	assertBuffered(t, (*loom.Pool)(nil).Submit(func() (int, error) { return 1, nil }), loom.ErrNilPool)
 	assertBuffered(t, (*loom.Pool)(nil).Submit[int](nil), loom.ErrNilPool)
-	if err := (*loom.Pool)(nil).Close(); !errors.Is(err, loom.ErrNilPool) {
-		t.Fatal(err)
-	}
 }
 
 func assertBuffered[R comparable](t *testing.T, ch <-chan loom.Result[R], want error) {
@@ -293,91 +293,6 @@ func zeroSnapshot(s loom.Snapshot) bool {
 	return s.Size == 0 && s.Idle == 0 && s.Running == 0 && s.Waiting == 0 &&
 		len(s.WaitingBy) == 0 && len(s.RunningTasks) == 0 &&
 		s.Submitted == 0 && s.Completed == 0 && s.Failed == 0 && s.Alerted == 0
-}
-
-func TestCloseDrainsThenRejects(t *testing.T) {
-	p := mustPool(t, loom.Config{Size: 1, OccupyThreshold: -1})
-	release := make(chan struct{})
-	entered := make(chan struct{})
-	hold := p.Submit(func() (int, error) {
-		close(entered)
-		<-release
-		return 0, nil
-	})
-	<-entered
-	queued := p.Submit(func() (int, error) { return 1, nil }, loom.WithPriority(1))
-
-	errCh := make(chan error, 2)
-	go func() { errCh <- p.Close() }()
-	go func() { errCh <- p.Close() }()
-	select {
-	case err := <-errCh:
-		t.Fatalf("Close returned before the running task finished: %v", err)
-	case <-time.After(80 * time.Millisecond):
-	}
-	close(release)
-
-	got := recv(t, hold)
-	if got.Err != nil || got.Value != 0 {
-		t.Fatalf("value=%d err=%v", got.Value, got.Err)
-	}
-	if got.Snapshot.Idle != 0 || got.Snapshot.Waiting != 0 || len(got.Snapshot.RunningTasks) != 1 || got.Snapshot.RunningTasks[0].Priority != 1 {
-		t.Fatalf("hold snapshot: %+v running=%+v", got.Snapshot, got.Snapshot.RunningTasks)
-	}
-	queuedGot := recv(t, queued)
-	if queuedGot.Err != nil || queuedGot.Value != 1 {
-		t.Fatalf("queued value=%d err=%v", queuedGot.Value, queuedGot.Err)
-	}
-	if queuedGot.Snapshot.Idle < 1 {
-		t.Fatalf("last result Idle=%d", queuedGot.Snapshot.Idle)
-	}
-	for range 2 {
-		if err := <-errCh; err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	ch := p.Submit(func() (int, error) { return 2, nil })
-	select {
-	case rejected := <-ch:
-		if !errors.Is(rejected.Err, loom.ErrClosed) {
-			t.Fatal(rejected.Err)
-		}
-		if rejected.Snapshot.Idle != 0 || rejected.Snapshot.Running != 0 || rejected.Snapshot.Waiting != 0 || rejected.Snapshot.Size != 1 {
-			t.Fatalf("snapshot: %+v", rejected.Snapshot)
-		}
-		if rejected.Snapshot.Submitted != 2 || rejected.Snapshot.Completed != 2 {
-			t.Fatalf("counters: %+v", rejected.Snapshot)
-		}
-	default:
-		t.Fatal("ErrClosed was not buffered")
-	}
-}
-
-func TestCloseExitsGoroutines(t *testing.T) {
-	before := runtime.NumGoroutine()
-	p, err := loom.New(loom.Config{Size: 3, OccupyThreshold: 20 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := p.Close(); err != nil {
-		t.Fatal(err)
-	}
-	waitGoroutines(t, before)
-}
-
-func TestCloseDoesNotWaitFullInspectInterval(t *testing.T) {
-	p, err := loom.New(loom.Config{Size: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	start := time.Now()
-	if err := p.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Fatalf("Close took %s", elapsed)
-	}
 }
 
 func TestAlertWhileTaskStillRunning(t *testing.T) {
@@ -561,62 +476,6 @@ func TestConcurrencyCap(t *testing.T) {
 	}
 }
 
-func TestSubmitCloseRace(t *testing.T) {
-	for range 20 {
-		p, err := loom.New(loom.Config{Size: 4, OccupyThreshold: 5 * time.Millisecond})
-		if err != nil {
-			t.Fatal(err)
-		}
-		var wg sync.WaitGroup
-		stop := make(chan struct{})
-		wg.Add(4)
-		errCh := make(chan error, 4)
-		for range 4 {
-			go func() {
-				defer wg.Done()
-				for {
-					select {
-					case <-stop:
-						return
-					default:
-					}
-					ch := p.Submit(func() (int, error) { return 1, nil })
-					select {
-					case got := <-ch:
-						if got.Err != nil && !errors.Is(got.Err, loom.ErrClosed) {
-							select {
-							case errCh <- got.Err:
-							default:
-							}
-						}
-					case <-time.After(3 * time.Second):
-						select {
-						case errCh <- errors.New("submit stalled"):
-						default:
-						}
-						return
-					}
-				}
-			}()
-		}
-		time.Sleep(5 * time.Millisecond)
-		if err := p.Close(); err != nil {
-			t.Fatal(err)
-		}
-		close(stop)
-		wg.Wait()
-		select {
-		case err := <-errCh:
-			t.Fatal(err)
-		default:
-		}
-		got := recv(t, p.Submit(func() (int, error) { return 1, nil }))
-		if !errors.Is(got.Err, loom.ErrClosed) || got.Snapshot.Idle != 0 || got.Snapshot.Running != 0 || got.Snapshot.Waiting != 0 {
-			t.Fatalf("after close: err=%v snap=%+v", got.Err, got.Snapshot)
-		}
-	}
-}
-
 func TestConcurrentSubmit(t *testing.T) {
 	p := mustPool(t, loom.Config{Size: 4, OccupyThreshold: -1})
 	const n = 100
@@ -671,17 +530,5 @@ func checkSnapshot(t *testing.T, snap loom.Snapshot) {
 			t.Errorf("WaitingBy not sorted: %+v", snap.WaitingBy)
 			break
 		}
-	}
-}
-
-func waitGoroutines(t *testing.T, before int) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for runtime.NumGoroutine() > before {
-		if time.Now().After(deadline) {
-			t.Fatalf("goroutines before=%d after=%d", before, runtime.NumGoroutine())
-		}
-		runtime.Gosched()
-		time.Sleep(10 * time.Millisecond)
 	}
 }

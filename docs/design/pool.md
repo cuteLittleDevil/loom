@@ -41,19 +41,15 @@ p, err := loom.New(loom.Config{
 if err != nil {
     return err
 }
-defer p.Close()
 ```
 
-`Size` 是同时执行的用户函数上限。`New` 成功时立刻启动一个协调者 goroutine，不为排队任务预开协程。有空闲槽位时，协调者再启动任务协程去执行用户函数；槽位用完就只进优先级队列。告警开启时再启动一个巡检 goroutine。`Size <= 0` 时 `New` 返回 `nil, ErrInvalidSize`，不启动任何 goroutine。
+`Size` 是同时执行的用户函数上限。`New` 成功时立刻启动一个协调者 goroutine，不为排队任务预开协程。有空闲槽位时，协调者再启动任务协程去执行用户函数；槽位用完就只进优先级队列。告警开启时再启动一个巡检 goroutine。协调者和巡检随进程存在，池子不提供 `Close`。`Size <= 0` 时 `New` 返回 `nil, ErrInvalidSize`，不启动任何 goroutine。
 
 `OccupyThreshold` 是单次任务的占用告警线。零值按 30s 处理。负值表示不启动巡检、不告警。正值即使小于 1s 也照用，池子不另设最小阈值。`OnAlert` 可以为 nil：计数和 `TaskInfo.Alerted` 仍然更新，只是没有回调。
 
-调度状态只放在协调者协程里。运行中的任务在它的唯一 `map[uint64]*task` 上，各优先级的排队数量记在同一协调者的 `waitCount` 里，提交、完成、失败和告警次数也只由它修改。用户函数和 `OnAlert` 都在协调者之外执行。`Submit`、`Close`、巡检和回调可以并发，它们把操作发给协调者，由协调者串行执行。
+调度状态只放在协调者协程里。运行中的任务在它的唯一 `map[uint64]*task` 上，各优先级的排队数量记在同一协调者的 `waitCount` 里，提交、完成、失败和告警次数也只由它修改。用户函数和 `OnAlert` 都在协调者之外执行。`Submit`、巡检和回调可以并发，它们把操作发给协调者，由协调者串行执行。
 
-`Submit` 本身只等到协调者接受或拒绝，不等到用户函数结束。在回调或用户函数里调用它不会占住任务协程。下面两种同步等待会死锁，池子不为此加槽位，也不代为取消：
-
-- 用户函数里接收同一个池的 `Submit` channel。外层任务占着槽位，满员时内层任务排不上。
-- 回调或用户函数里调用 `Close`。`Close` 会等到任务协程、协调者和巡检退出，于是和这次等待互等。
+`Submit` 本身只等到协调者接受，不等到用户函数结束。在回调或用户函数里调用它不会占住任务协程。用户函数里接收同一个池的 `Submit` channel 会死锁：外层任务占着槽位，满员时内层任务排不上。池子不为此加槽位，也不代为取消。
 
 ### Submit 立刻返回 channel，任务协程结束后送出一次 Result
 
@@ -103,10 +99,10 @@ channel 的容量是 1。进入终态并复制快照之后，任务协程离开�
 
 调用方的 goroutine 不被 `Submit` 占住。调度只有一条路：把接受操作发给协调者，由协调者启动的任务协程执行。不存在「调用方看到空闲槽位就自己跑函数」或「新任务抢走已经排着队的位置」的快路径。
 
-接受发生在协调者里，并且和关闭检查是同一次操作：
+接受发生在协调者里：
 
-1. 已 `Close` 则拒绝，任务不存在。
-2. 否则分配任务 ID，`Submitted` 加 1。有空闲槽位时，这个任务直接标成 `Running`，协调者接着启动它的任务协程；没有时，任务进入优先级队列。有空闲槽位时队列一定是空的，所以直接标成 `Running` 不会插队。
+1. 分配任务 ID，`Submitted` 加 1。
+2. 有空闲槽位时，这个任务直接标成 `Running`，协调者接着启动它的任务协程；没有时，任务进入优先级队列。有空闲槽位时队列一定是空的，所以直接标成 `Running` 不会插队。
 
 任务 ID 是从 1 起、每次加 1 的 `uint64`，不复用。被拒绝的提交不占 ID。同优先级按 ID 从小到大执行，不使用时间戳。ID 就是提交顺序。
 
@@ -159,13 +155,12 @@ type TaskInfo struct {
 协调者这次操作返回时下列式子成立：
 
 - `Waiting > 0` 时 `Idle == 0`。有人排队就没有空闲槽位。
-- 未 `Close` 时 `Idle + Running == Size`。
-- 已 `Close` 且排空完成时 `Idle == 0`、`Running == 0`。排空过程中 `Idle + Running <= Size`。
+- `Idle + Running == Size`。
 - `Running + Waiting == Submitted - Completed`。
 
-因此，一个任务结束时，同一次协调者操作里先把它从运行表删除并计入终态，再按优先级把下一个排队任务标成 `Running`，然后才复制快照。队列非空时，这份快照不会把刚空出的槽位算成空闲；刚结束的任务自己不在 `RunningTasks` 中，下一个任务已经在里面。队列为空时，这个槽位还在，快照里算作 `Idle`，和关闭标志无关。快照复制之后，任务协程先送出 `Result`，协调者才启动下一个用户函数。所以排空中最后一条任务的 `Result` 仍可能 `Idle >= 1`；`Close` 返回之后再 `Submit`，收到的快照才会是 `Idle == 0`。
+因此，一个任务结束时，同一次协调者操作里先把它从运行表删除并计入终态，再按优先级把下一个排队任务标成 `Running`，然后才复制快照。队列非空时，这份快照不会把刚空出的槽位算成空闲；刚结束的任务自己不在 `RunningTasks` 中，下一个任务已经在里面。队列为空时，这个槽位还在，快照里算作 `Idle`。快照复制之后，任务协程先送出 `Result`，协调者才启动下一个用户函数。
 
-`Idle > 0` 只说明采集时没有排队任务。未关闭时，随后的 `Submit` 不需要等别的任务结束，但仍然由协调者启动的任务协程执行。已关闭时，`Idle` 不表示还能提交。
+`Idle > 0` 只说明采集时没有排队任务。随后的 `Submit` 不需要等别的任务结束，但仍然由协调者启动的任务协程执行。
 
 ```go
 func (p *Pool) execute(job *task) {
@@ -178,16 +173,13 @@ func (p *Pool) execute(job *task) {
 
 ### 拒绝也走 channel，能看见池子时就带快照
 
-`p == nil`、`fn == nil` 在进入协调者之前拒绝。`p == nil` 优先于 `fn == nil`。两者都返回已经放好一次 `Result` 的 channel：`Err` 是对应哨兵，`Value` 和 `Snapshot` 都是零值，不读取池子，计数器不变。
-
-池已 `Close` 的拒绝在协调者里进行。协调者退出之后，拒绝直接读它发布的最终快照。channel 同样已经放好一次 `Result`：`Err` 是 `ErrClosed`，`Snapshot` 是当时的实况或最终快照，计数器不变，任务不接受。`Submit` 调用本身仍然立刻返回。
+`p == nil`、`fn == nil` 在进入协调者之前拒绝。`p == nil` 优先于 `fn == nil`。两者都返回已经放好一次 `Result` 的 channel：`Err` 是对应哨兵，`Value` 和 `Snapshot` 都是零值，不读取池子，计数器不变。`Submit` 调用本身仍然立刻返回。
 
 ```go
 var (
     ErrInvalidSize = errors.New("loom: invalid size")
     ErrNilPool     = errors.New("loom: nil pool")
     ErrNilFunc     = errors.New("loom: nil func")
-    ErrClosed      = errors.New("loom: pool closed")
     ErrPanic       = errors.New("loom: task panic")
 )
 ```
@@ -198,7 +190,7 @@ var (
 
 | 事件 | Submitted | Completed | Failed |
 | --- | --- | --- | --- |
-| `p == nil`、`fn == nil`、`ErrClosed` | 不变 | 不变 | 不变 |
+| `p == nil`、`fn == nil` | 不变 | 不变 | 不变 |
 | 接受，并标成 `Running` 或入队 | +1 | 不变 | 不变 |
 | 函数返回 `(v, nil)` | 不变 | +1 | 不变 |
 | 函数返回非 nil 错误，或 panic | 不变 | +1 | +1 |
@@ -243,17 +235,7 @@ type Alert struct {
 
 告警和调度是两条路。`OnAlert` 不取消任务，不调整优先级，不把任务协程从用户函数里拽出来。调用方若只看自己的 `Result`，可以读 `Snapshot.RunningTasks[].Alerted` 和 `Snapshot.Alerted`。那是终态那一刻的记录；任务还在跑的时候，通知靠 `OnAlert`。
 
-池未满时同样巡检。一个任务卡住时，即使还没有人在排队，占用事实已经成立。
-
-### Close 拒绝新任务，并等待已经接受的任务结束
-
-`Close` 让协调者置上关闭标志，唤醒巡检，然后等待。等待的范围是：置位之前已经接受的任务全部进入终态，对应的 `Result` 已经发送，任务协程退出；若巡检存在，则它也退出；协调者发布最终快照后退出。不调用 `Close` 时，协调者和巡检不退出。巡检把退出检查放在回调之外：已经 `Close` 且 `Running == 0`、`Waiting == 0` 就退出。正在执行的回调不打断，返回后再检查。唤醒是为了让排空不必睡满当前巡检间隔。因此在调用方不从回调或用户函数里同步等待 `Close` 的前提下，`Close` 返回时，排空期间决定发出的 `OnAlert` 已经返回。
-
-置位之后的 `Submit` 在 channel 里送出 `ErrClosed` 和当时的快照，不接受任务。置位之前已接受的任务会按原优先级跑完。没有丢掉排队任务的操作，也没有按任务取消的操作。函数一直不返回时，`Close` 会一直阻塞。
-
-`p == nil` 时 `Close` 返回 `ErrNilPool`。对同一个池多次或并发调用 `Close`，等的是同一次排空，结束后返回 nil，不返回 `ErrClosed`。`New` 失败时没有可关闭的池。
-
-关闭完成之后再 `Submit`，收到的快照里 `Idle == 0`、`Running == 0`、`Waiting == 0`，`Size` 仍是配置值。这是协调者退出前发布的最终快照。排空过程中，已经结束的任务不再留在运行表里。
+池未满时同样巡检。一个任务卡住时，即使还没有人在排队，占用事实已经成立。巡检不退出。
 
 ## Rationale / 理由与取舍
 
@@ -295,7 +277,7 @@ type Alert struct {
 
 我们也放弃用 `context` 取消排队任务。`Submit` 的签名里没有 `context`，函数也不接收它。已经接受的任务一定会跑完。
 
-代价是调用方如果提交得比消费快，排队任务会一直占内存，而且没有任何 API 能把它们拿下来。`Close` 只会等它们执行完。每个排队任务持有闭包和一条容量为 1 的 channel，不持有调用方 goroutine。
+代价是调用方如果提交得比消费快，排队任务会一直占内存，而且没有任何 API 能把它们拿下来或停掉池子。每个排队任务持有闭包和一条容量为 1 的 channel，不持有调用方 goroutine。协调者和巡检一直留到进程结束。
 
 ### 低优先级可能一直排不到，第一版不做老化
 
@@ -313,7 +295,7 @@ type Alert struct {
 
 ### 不引入第三方协程池
 
-现成池子的提交口通常是 `func()`，返回值要调用方自己塞 channel，优先级和占用告警也要在外面再包一层。那一层包完，和自己写一个小池子的代码量接近，还多一个核心依赖。这个池子的调度、告警和快照都在标准库能表达的范围内：`container/heap`、channel、`sync/atomic`、`time`、`runtime/debug`。`sync/atomic` 只用来发布协调者退出前的最终快照，不保护运行表。方法上的类型参数使用 Go 1.27 的语言能力，不是第三方包。
+现成池子的提交口通常是 `func()`，返回值要调用方自己塞 channel，优先级和占用告警也要在外面再包一层。那一层包完，和自己写一个小池子的代码量接近，还多一个核心依赖。这个池子的调度、告警和快照都在标准库能表达的范围内：`container/heap`、channel、`time`、`runtime/debug`。方法上的类型参数使用 Go 1.27 的语言能力，不是第三方包。
 
 ## Compatibility / 兼容性
 
@@ -324,8 +306,8 @@ type Alert struct {
 使用上的代价需要直接接受：
 
 - `Submit` 不占调用方 goroutine。1000 个排队任务是 1000 个闭包和 1000 条容量为 1 的 channel，外加 1 条协调者，以及最多 `Size` 条正在执行的任务协程；告警开启时再加 1 条巡检。接收 channel 的 goroutine 由调用方自己决定。
-- 队列不封顶，也不能按任务取消。内存随已接受、尚未执行的任务增长。`Close` 会等它们全部跑完。
-- 用户函数里同步接收同一个池的 channel，满员时会死锁。回调或用户函数里同步 `Close`，也会死锁。
+- 队列不封顶，也不能按任务取消，池子也不能关闭。内存随已接受、尚未执行的任务增长。协调者和巡检一直留到进程结束。
+- 用户函数里同步接收同一个池的 channel，满员时会死锁。
 - 运行时间超过阈值，但在巡检看到之前就结束的任务，不会有 `OnAlert`。
 - 快照里的 `Idle` 不承诺下一次 `Submit` 还能立刻开始，也不描述接收时刻的池子。它只描述任务终态那一刻，并且那一刻没有排队任务。
 
@@ -338,11 +320,10 @@ type Alert struct {
 1. `New`、协调者、泛型方法 `Submit`、容量为 1 的一次发送、`PanicError`、计数器，以及「终态后在同一次协调者操作里分派下一个，再复制快照，离开协调者后发送」。
 2. 优先级堆。只从队首取，不按任务删除。
 3. 巡检 goroutine、按周期合并的 `OnAlert`、回调 panic 恢复、`Alerted` 计数。
-4. `Close` 拒绝新任务，等待已接受任务终态并且 `Result` 已发送，再等待任务协程、协调者和巡检退出。
 
 验收用 `go test`，至少覆盖这些路径：
 
-- `Submit` 在函数返回之前就把 channel 交出来。队列为空时，接收到的 `Value` 是函数的 `R`，该任务不在 `RunningTasks` 中。未关闭时 `Idle + Running == Size`，且 `Idle >= 1`。channel 随后关闭，第二次接收的 `ok` 为 false。
+- `Submit` 在函数返回之前就把 channel 交出来。队列为空时，接收到的 `Value` 是函数的 `R`，该任务不在 `RunningTasks` 中。`Idle + Running == Size`，且 `Idle >= 1`。channel 随后关闭，第二次接收的 `ok` 为 false。
 - 调用方不接收时，任务协程仍能执行下一个任务。
 - `Size` 为 1 时，先占住唯一槽位，再按优先级 1、10、5 提交三个任务。占住的任务放开之后，三个任务的开始顺序是 10、5、1。占住的任务的 `Result` 里，优先级 10 已经在 `RunningTasks` 中，`Idle == 0`，`Waiting == 2`。
 - 任务执行超过 `OccupyThreshold` 且仍被巡检看到时，`OnAlert` 被调用，该任务的 `Result` 仍是原来的成功结果。一次巡检跨过多个周期只回调一次，`Alerted` 只加 1。在下一次巡检前结束的任务可以不告警。
@@ -350,7 +331,6 @@ type Alert struct {
 - 函数返回非 nil 错误时，`Result.Err` 就是该错误，`Failed` 加 1。
 - 函数 panic 后，`errors.Is` 识别 `ErrPanic`，`errors.As` 得到原来的值和栈，池子还能执行下一个任务。
 - `p == nil`、`fn == nil` 时，channel 在 `Submit` 返回前就已经放好对应哨兵和零值快照，不改变已有池的计数器。两者都为 nil 时是 `ErrNilPool`。
-- `Close` 之后的 `Submit` 得到 `ErrClosed` 和实况快照。`Close` 之前已接受的任务仍会执行并送出 `Result`。并发的再次 `Close` 等到同一次排空结束后返回 nil。排空结束时任务协程、协调者和巡检都已退出。
 
 这一版没有独立的迁移工具，也没有特性开关。未确认前，业务代码不应依赖这些名字。
 
@@ -366,16 +346,12 @@ type Alert struct {
 | `p == nil` | 已放好的 channel，`ErrNilPool`，零值快照，不进协调者 |
 | `fn == nil` 且池非 nil | 已放好的 channel，`ErrNilFunc`，零值快照，不进协调者 |
 | `opts` 中的 nil、重复的 `WithPriority` | nil 忽略；优先级以后一个为准 |
-| 池已 `Close` | 已放好的 channel，`ErrClosed` 加实况快照，不接受 |
 | 已接受 | `Submit` 立刻返回；终态后发送一次并 `close` |
 | 函数返回 `(v, err)` | `Result` 为 `{Value: v, Snapshot: snap, Err: err}`，`err` 不包装 |
 | 函数返回非 nil 错误 | `Failed` 加 1 |
 | 函数 panic | 零值、快照、`*PanicError`；`errors.Is` 为 `ErrPanic` |
 | 没人接收 | 任务协程不阻塞，继续下一个任务 |
-| `p == nil` 时调用 `Close` | `ErrNilPool` |
-| 重复或并发 `Close` | 等待同一次排空，返回 nil |
 | 用户函数里同步接收同一个池的 channel | 满员时会死锁；不扩容 |
-| 回调或用户函数里同步 `Close` | 会死锁；不代为取消 |
 
 ### 为什么 Submit 是方法
 
