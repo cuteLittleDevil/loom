@@ -522,6 +522,101 @@ func TestOnAlertPanicContinues(t *testing.T) {
 	close(release)
 }
 
+func TestConcurrencyCap(t *testing.T) {
+	const size = 3
+	p := mustPool(t, loom.Config{Size: size, OccupyThreshold: -1})
+	var cur atomic.Int32
+	var maxSeen atomic.Int32
+	var wg sync.WaitGroup
+	const n = 30
+	wg.Add(n)
+	for range n {
+		go func() {
+			defer wg.Done()
+			ch := p.Submit(func() (int, error) {
+				c := cur.Add(1)
+				for {
+					old := maxSeen.Load()
+					if c <= old || maxSeen.CompareAndSwap(old, c) {
+						break
+					}
+				}
+				time.Sleep(2 * time.Millisecond)
+				cur.Add(-1)
+				return 1, nil
+			})
+			select {
+			case got := <-ch:
+				if got.Err != nil || got.Value != 1 {
+					t.Errorf("value=%d err=%v", got.Value, got.Err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Error("task timed out")
+			}
+		}()
+	}
+	wg.Wait()
+	if got := maxSeen.Load(); got > size {
+		t.Fatalf("max concurrent %d", got)
+	}
+}
+
+func TestSubmitCloseRace(t *testing.T) {
+	for range 20 {
+		p, err := loom.New(loom.Config{Size: 4, OccupyThreshold: 5 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		stop := make(chan struct{})
+		wg.Add(4)
+		errCh := make(chan error, 4)
+		for range 4 {
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					ch := p.Submit(func() (int, error) { return 1, nil })
+					select {
+					case got := <-ch:
+						if got.Err != nil && !errors.Is(got.Err, loom.ErrClosed) {
+							select {
+							case errCh <- got.Err:
+							default:
+							}
+						}
+					case <-time.After(3 * time.Second):
+						select {
+						case errCh <- errors.New("submit stalled"):
+						default:
+						}
+						return
+					}
+				}
+			}()
+		}
+		time.Sleep(5 * time.Millisecond)
+		if err := p.Close(); err != nil {
+			t.Fatal(err)
+		}
+		close(stop)
+		wg.Wait()
+		select {
+		case err := <-errCh:
+			t.Fatal(err)
+		default:
+		}
+		got := recv(t, p.Submit(func() (int, error) { return 1, nil }))
+		if !errors.Is(got.Err, loom.ErrClosed) || got.Snapshot.Idle != 0 || got.Snapshot.Running != 0 || got.Snapshot.Waiting != 0 {
+			t.Fatalf("after close: err=%v snap=%+v", got.Err, got.Snapshot)
+		}
+	}
+}
+
 func TestConcurrentSubmit(t *testing.T) {
 	p := mustPool(t, loom.Config{Size: 4, OccupyThreshold: -1})
 	const n = 100
