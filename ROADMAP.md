@@ -14,6 +14,10 @@
 
 ## 最近完成
 
+- 2026-09-23 14:49 README 使用示例补上 `Size`、告警、`Degrade`、`sign` 和 `loom.Result` 的注释。`README.md`
+- 2026-09-23 14:48 README 使用示例改为提交自定义结构体 `Result{Name}`，`got.Value` 即该结构体。`README.md`
+- 2026-09-23 14:42 例子、README 和设计文档里的日志改为 `log/slog`。`example/` `README.md` `docs/design/pool.md` `pool_test.go`
+- 2026-09-23 14:40 增加 `example/basic`、`example/priority`、`example/degrade`、`example/alert`，README 写上运行命令。`README.md`
 - 2026-09-23 14:35 补充提交流程图 `docs/flow.svg`，并按当前实现重写 `README.md`。`docs/design/pool.md`
 - 2026-09-23 14:18 增加 `Config.Degrade`。池满时把当前运行任务交给它判断：返回 true 则另开协程直接执行，不占 `Size`；返回 false 则照旧排队。`pool.go` `coordinator.go` `pool_test.go` `docs/design/pool.md` `README.md`
 - 2026-09-23 14:10 `Submit` 增加 `sign` 参数，作为来源标记写入 `TaskInfo` 和 `Alert`，不参与调度。`pool.go` `coordinator.go` `alert.go` `executor.go` `pool_test.go` `docs/design/pool.md` `README.md`
@@ -29,6 +33,10 @@
 
 ## 最近验证
 
+- 2026-09-23 14:49 README 示例只增加注释，未改可执行语句，沿用 14:48 的 `go run` 结果。
+- 2026-09-23 14:48 将 README 使用示例抽到临时模块 `go run`，输出 `result name=ok`。
+- 2026-09-23 14:42 四个 example 改为 `slog` 后重新 `go run`，分别打出 result、order `[10 5 1]`、degraded、alert。`go test -count=1 -run TestUnreadResultDoesNotBlockWorker` 通过。
+- 2026-09-23 14:40 `go run ./example/basic` 输出 `value=ok`；`go run ./example/priority` 输出 `order= 10 5 1`；`go run ./example/degrade` 输出池外执行且 `submitted=1`；`go run ./example/alert` 打出 `sign=slow`。`go test -count=1 ./...` 通过。
 - 2026-09-23 14:35 对照 `coordinator.go` 的接受、降级、finish、release 和 `alert.go` 的巡检，核对 `docs/flow.svg` 与 `README.md` 的分支一致。未改调度代码，未重跑测试。
 - 2026-09-23 14:18 `GOTOOLCHAIN=go1.27.1 go test -race -count=1 -timeout 180s ./...` 通过；`go vet ./...` 通过。池满且 `Degrade` 返回 true 时任务在池外执行；返回 false 时继续排队；有空槽位时不调用 `Degrade`。
 - 2026-09-23 14:10 `GOTOOLCHAIN=go1.27.1 go test -race -count=1 -timeout 180s ./...` 通过；`go vet ./...` 通过。运行中任务的 `Sign` 和告警的 `Sign` 与提交时一致。

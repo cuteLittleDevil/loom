@@ -3,6 +3,7 @@ package loom_test
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"runtime"
 	"slices"
 	"sync"
@@ -94,9 +95,9 @@ func TestUnreadResultDoesNotBlockWorker(t *testing.T) {
 		time.Sleep(1 * time.Second)
 		return 2, nil
 	})
-	fmt.Println(time.Now(), "1")
+	slog.Info("recv", "step", 1, "at", time.Now())
 	got := recv(t, ch)
-	fmt.Println(time.Now(), "2")
+	slog.Info("recv", "step", 2, "at", time.Now())
 	if got.Value != 2 || got.Err != nil {
 		t.Fatalf("value=%d err=%v", got.Value, got.Err)
 	}

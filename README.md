@@ -17,55 +17,99 @@
 
 不变量和取舍见 [docs/design/pool.md](docs/design/pool.md) 。
 
+## 例子
+
+在仓库根目录执行：
+
+```bash
+go run ./example/basic
+go run ./example/priority
+go run ./example/degrade
+go run ./example/alert
+```
+
+| 目录 | 演示 |
+| --- | --- |
+| `example/basic` | 提交一次任务并读取 `Result` |
+| `example/priority` | `Size` 为 1 时，优先级 1、10、5 的开始顺序是 10、5、1 |
+| `example/degrade` | 唯一槽位被占住时，`Degrade` 返回 true，后来的任务在池外执行 |
+| `example/alert` | 任务运行超过 40ms 后打印一次 `OnAlert` |
+
 ## 使用
 
 ```go
-p, err := loom.New(loom.Config{
-    Size:            8,
-    OccupyThreshold: 30 * time.Second,
-    OnAlert: func(a loom.Alert) {
-        log.Printf("sign=%s id=%d running=%s waiting=%d", a.Sign, a.TaskID, a.RunningFor, a.Waiting)
-    },
-    Degrade: func(running []loom.TaskInfo) bool {
-        if len(running) < 8 {
-            return false
-        }
-        for _, task := range running {
-            if task.RunningFor < 30*time.Second {
-                return false
-            }
-        }
-        return true
-    },
-})
-if err != nil {
-    return err
+package main
+
+import (
+	"log/slog"
+	"os"
+	"time"
+
+	"github.com/cuteLittleDevil/loom"
+)
+
+// Result 是业务自己的结构体。Submit 的类型参数 R 由函数返回值推断，调用方不用写出 [R]。
+type Result struct {
+	Name string
 }
 
-ch := p.Submit("billing", func() (string, error) {
-    return "ok", nil
-}, loom.WithPriority(10))
-got := <-ch
-if got.Err != nil {
-    return got.Err
+func main() {
+	// Size 是同时执行的用户函数上限，必须大于 0。
+	// OccupyThreshold 大于等于 0 才启动巡检。任务还在跑且超过 30s 时调用 OnAlert，回调在协调者之外。
+	// 8 个槽位都忙，并且每个任务都已运行至少 30s 时，Degrade 返回 true，这次提交改到池外执行，不占 Size。
+	p, err := loom.New(loom.Config{
+		Size:            8,
+		OccupyThreshold: 30 * time.Second,
+		OnAlert: func(a loom.Alert) {
+			slog.Info("occupy", "sign", a.Sign, "id", a.TaskID, "running", a.RunningFor, "waiting", a.Waiting)
+		},
+		Degrade: func(running []loom.TaskInfo) bool {
+			if len(running) < 8 {
+				return false
+			}
+			for _, task := range running {
+				if task.RunningFor < 30*time.Second {
+					return false
+				}
+			}
+			return true
+		},
+	})
+	if err != nil {
+		slog.Error("create pool", "err", err)
+		os.Exit(1)
+	}
+
+	// sign 是来源标记，不参与优先级和任务 ID 排序。WithPriority 数值更大的先执行。
+	// Submit 立刻返回容量为 1 的 channel，不等待函数结束。
+	ch := p.Submit("sign", func() (Result, error) {
+		return Result{Name: "ok"}, nil
+	}, loom.WithPriority(10))
+	// got 的类型是 loom.Result[Result]。Value 是上面的业务结构体，Snapshot 是终态那一刻的池子。
+	got := <-ch
+	if got.Err != nil {
+		slog.Error("task", "err", got.Err)
+		os.Exit(1)
+	}
+	slog.Info("result", "name", got.Value.Name)
 }
-// got.Value 的类型是 string
-// got.Snapshot 是这次任务终态那一刻的池子
 ```
+
+`got` 的类型是 `loom.Result[Result]`。`got.Value` 是上面的结构体，`got.Snapshot` 是这次任务终态那一刻的池子。
 
 `Size` 必须大于 0，否则 `New` 返回 `ErrInvalidSize`，并且不启动协程。
 
 ## 提交
 
 ```go
-func (p *Pool) Submit[R any](sign string, fn func() (R, error), opts ...Option) <-chan Result[R]
+func (p *Pool) Submit[R any](sign string, fn func() (R, error), opts ...Option) <-chan loom.Result[R]
 ```
 
 `sign` 是来源标记，原样出现在 `TaskInfo.Sign` 和 `Alert.Sign` 上，不参与优先级和任务 ID 排序。空字符串允许。
 
 `fn` 的返回值决定 `R`。调用方通常不用写出 `[R]`。未传 `WithPriority` 时优先级是 0，数值更大的先执行，相同数值按任务 ID 从小到大。多个 `WithPriority` 同时出现时，最后一个生效。`opts` 里的 nil 项忽略。
 
-返回的 channel 容量是 1。终态后送出一次 `Result` 并关闭。没人接收也不会堵住任务协程。第二次接收得到零值和 `ok == false`。
+返回的 channel 容量是 1。终态后送出一次 `loom.Result[R]` 并关闭。没人接收也不会堵住任务协程。第二次接收得到零值和 `ok == false`。
 
 `p == nil` 得到 `ErrNilPool`，`fn == nil` 得到 `ErrNilFunc`。两者都为 nil 时是 `ErrNilPool`。这两种结果在 `Submit` 返回前就已经放进 channel，不进入协调者，也不改变计数。
 

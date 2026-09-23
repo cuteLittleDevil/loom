@@ -34,8 +34,7 @@ p, err := loom.New(loom.Config{
     Size:            8,
     OccupyThreshold: 30 * time.Second,
     OnAlert: func(a loom.Alert) {
-        log.Printf("task %d priority %d running %s, waiting %d",
-            a.TaskID, a.Priority, a.RunningFor, a.Waiting)
+        slog.Info("occupy", "id", a.TaskID, "priority", a.Priority, "running", a.RunningFor, "waiting", a.Waiting)
     },
 })
 if err != nil {
