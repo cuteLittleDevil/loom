@@ -20,6 +20,12 @@ type Config struct {
 	// OnAlert 在协调者之外调用，可以为 nil。
 	// 为 nil 时仍然更新告警计数。不要在用户函数里同步接收本池的 channel。
 	OnAlert func(Alert)
+	// Degrade 在没有空闲槽位、任务即将排队时调用，可以为 nil。
+	// running 是当时已标成 Running 的任务，用来查看它们是否一直占着槽位。
+	// 返回 true：这次任务不进池，另开协程直接执行，不占用 Size，不计入 Submitted。
+	// 返回 false 或 Degrade 为 nil：进入优先级队列。
+	// 回调在协调者之外执行。不要在里面同步接收本池的 channel。
+	Degrade func(running []TaskInfo) bool
 }
 
 // Pool 是固定容量的协程池。
@@ -30,6 +36,7 @@ type Pool struct {
 	size      int
 	threshold time.Duration
 	onAlert   func(Alert)
+	degrade   func([]TaskInfo) bool
 	interval  time.Duration
 
 	// operationFuncChan 缓冲 operationBuffer。
@@ -58,6 +65,7 @@ func New(cfg Config) (*Pool, error) {
 		size:              cfg.Size,
 		threshold:         threshold,
 		onAlert:           cfg.OnAlert,
+		degrade:           cfg.Degrade,
 		operationFuncChan: make(chan operationFunc, operationBuffer),
 	}
 	if alerts {

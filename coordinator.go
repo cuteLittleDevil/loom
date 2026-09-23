@@ -34,6 +34,10 @@ type sched struct {
 	ready []*task
 	// launch 是本次操作结束后要启动的那一个任务。每次操作最多产生一个。
 	launch *task
+	// decide 是池满时等待降级判断的那一个任务。判断在协调者之外做。
+	decide        *task
+	decideRunning []TaskInfo
+	degrade       func([]TaskInfo) bool
 }
 
 func newSched(p *Pool) *sched {
@@ -43,6 +47,7 @@ func newSched(p *Pool) *sched {
 		nextID:    1,
 		waitCount: make(map[int]int),
 		running:   make(map[uint64]*task),
+		degrade:   p.degrade,
 	}
 }
 
@@ -52,6 +57,7 @@ func (p *Pool) run() {
 	for op := range p.operationFuncChan {
 		op(st)
 		p.startTask(st)
+		p.startDegrade(st)
 	}
 }
 
@@ -89,17 +95,64 @@ func (p *Pool) startTask(st *sched) {
 	go p.execute(job)
 }
 
+// startDegrade 把池满时的那一次判断放到协调者之外。
+// 返回降级则直接执行，不占槽位；否则再交回协调者排队。
+func (p *Pool) startDegrade(st *sched) {
+	job := st.decide
+	if job == nil {
+		return
+	}
+	running := st.decideRunning
+	st.decide = nil
+	st.decideRunning = nil
+	go p.runDegrade(job, running)
+}
+
+func (p *Pool) runDegrade(job *task, running []TaskInfo) {
+	bypass := false
+	func() {
+		defer func() { recover() }()
+		bypass = p.degrade(running)
+	}()
+	if !bypass {
+		p.enqueue(func(st *sched) {
+			st.admitWaiting(job)
+		})
+		return
+	}
+	job.exec()
+	var snap Snapshot
+	p.operate(func(st *sched) {
+		snap = st.snapshot(time.Now())
+	})
+	job.deliver(snap)
+}
+
 // accept 在协调者里接受任务。
 func (st *sched) accept(job *task, now time.Time) {
 	job.accepted = now
 	job.id = st.nextID
 	st.nextID++
-	st.submitted++
 	if len(st.running) < st.size {
-		st.markRunning(job, now)
-		st.launch = job
+		st.admitRunning(job, now)
 		return
 	}
+	if st.degrade != nil {
+		st.decide = job
+		st.decideRunning = st.runningInfos(now)
+		return
+	}
+	st.admitWaiting(job)
+}
+
+func (st *sched) admitRunning(job *task, now time.Time) {
+	st.submitted++
+	st.markRunning(job, now)
+	st.launch = job
+}
+
+func (st *sched) admitWaiting(job *task) {
+	st.submitted++
 	heap.Push(&st.queue, job)
 	st.waitCount[job.priority]++
 }
@@ -151,32 +204,15 @@ func (st *sched) counts() (idle, running, waiting int) {
 func (st *sched) snapshot(now time.Time) Snapshot {
 	idle, running, waiting := st.counts()
 	snap := Snapshot{
-		Size:      st.size,
-		Idle:      idle,
-		Running:   running,
-		Waiting:   waiting,
-		Submitted: st.submitted,
-		Completed: st.completed,
-		Failed:    st.failed,
-		Alerted:   st.alerted,
-	}
-	if n := len(st.running); n > 0 {
-		jobs := make([]*task, 0, n)
-		for _, job := range st.running {
-			jobs = append(jobs, job)
-		}
-		sort.Slice(jobs, func(i, j int) bool { return jobs[i].id < jobs[j].id })
-		snap.RunningTasks = make([]TaskInfo, len(jobs))
-		for i, job := range jobs {
-			snap.RunningTasks[i] = TaskInfo{
-				ID:         job.id,
-				Sign:       job.sign,
-				Priority:   job.priority,
-				WaitingFor: job.waitingFor,
-				RunningFor: now.Sub(job.started),
-				Alerted:    job.alerted,
-			}
-		}
+		Size:         st.size,
+		Idle:         idle,
+		Running:      running,
+		Waiting:      waiting,
+		Submitted:    st.submitted,
+		Completed:    st.completed,
+		Failed:       st.failed,
+		Alerted:      st.alerted,
+		RunningTasks: st.runningInfos(now),
 	}
 	if n := len(st.waitCount); n > 0 {
 		snap.WaitingBy = make([]PriorityCount, 0, n)
@@ -190,6 +226,30 @@ func (st *sched) snapshot(now time.Time) Snapshot {
 		})
 	}
 	return snap
+}
+
+func (st *sched) runningInfos(now time.Time) []TaskInfo {
+	n := len(st.running)
+	if n == 0 {
+		return nil
+	}
+	jobs := make([]*task, 0, n)
+	for _, job := range st.running {
+		jobs = append(jobs, job)
+	}
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].id < jobs[j].id })
+	infos := make([]TaskInfo, len(jobs))
+	for i, job := range jobs {
+		infos[i] = TaskInfo{
+			ID:         job.id,
+			Sign:       job.sign,
+			Priority:   job.priority,
+			WaitingFor: job.waitingFor,
+			RunningFor: now.Sub(job.started),
+			Alerted:    job.alerted,
+		}
+	}
+	return infos
 }
 
 // taskQueue 是最大优先级堆。优先级数值更大的先出；相同则 ID 更小的先出。

@@ -507,6 +507,99 @@ func TestConcurrentSubmit(t *testing.T) {
 	}
 }
 
+func TestDegradeRunsOutsideWhenBusy(t *testing.T) {
+	p := mustPool(t, loom.Config{
+		Size:            1,
+		OccupyThreshold: -1,
+		Degrade: func(running []loom.TaskInfo) bool {
+			return len(running) == 1 && running[0].Sign == "hold"
+		},
+	})
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	hold := p.Submit("hold", func() (int, error) {
+		close(entered)
+		<-release
+		return 1, nil
+	})
+	<-entered
+	started := make(chan struct{})
+	ch := p.Submit("extra", func() (int, error) {
+		close(started)
+		return 2, nil
+	})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("degraded task did not start")
+	}
+	got := recv(t, ch)
+	if got.Value != 2 || got.Err != nil {
+		t.Fatalf("value=%d err=%v", got.Value, got.Err)
+	}
+	if got.Snapshot.Submitted != 1 || got.Snapshot.Running != 1 || len(got.Snapshot.RunningTasks) != 1 || got.Snapshot.RunningTasks[0].Sign != "hold" {
+		t.Fatalf("snapshot: %+v running=%+v", got.Snapshot, got.Snapshot.RunningTasks)
+	}
+	close(release)
+	holdGot := recv(t, hold)
+	if holdGot.Value != 1 || holdGot.Err != nil {
+		t.Fatalf("hold value=%d err=%v", holdGot.Value, holdGot.Err)
+	}
+}
+
+func TestDegradeFalseStillWaits(t *testing.T) {
+	p := mustPool(t, loom.Config{
+		Size:            1,
+		OccupyThreshold: -1,
+		Degrade:         func([]loom.TaskInfo) bool { return false },
+	})
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	hold := p.Submit("hold", func() (int, error) {
+		close(entered)
+		<-release
+		return 1, nil
+	})
+	<-entered
+	started := make(chan struct{})
+	ch := p.Submit("next", func() (int, error) {
+		close(started)
+		return 2, nil
+	})
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-started:
+		t.Fatal("queued task started while the only slot was busy")
+	default:
+	}
+	close(release)
+	if got := recv(t, ch); got.Value != 2 || got.Err != nil {
+		t.Fatalf("value=%d err=%v", got.Value, got.Err)
+	}
+	if got := recv(t, hold); got.Value != 1 || got.Err != nil {
+		t.Fatalf("hold value=%d err=%v", got.Value, got.Err)
+	}
+}
+
+func TestDegradeNotUsedWhenIdle(t *testing.T) {
+	var called atomic.Bool
+	p := mustPool(t, loom.Config{
+		Size:            1,
+		OccupyThreshold: -1,
+		Degrade: func([]loom.TaskInfo) bool {
+			called.Store(true)
+			return true
+		},
+	})
+	got := recv(t, p.Submit("only", func() (int, error) { return 1, nil }))
+	if got.Value != 1 || got.Err != nil || got.Snapshot.Submitted != 1 {
+		t.Fatalf("value=%d err=%v snap=%+v", got.Value, got.Err, got.Snapshot)
+	}
+	if called.Load() {
+		t.Fatal("Degrade called while a slot was free")
+	}
+}
+
 func checkSnapshot(t *testing.T, snap loom.Snapshot) {
 	t.Helper()
 	if snap.Waiting > 0 && snap.Idle != 0 {
