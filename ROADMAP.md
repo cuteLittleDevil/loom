@@ -14,6 +14,7 @@
 
 ## 最近完成
 
+- 2026-09-23 14:35 补充提交流程图 `docs/flow.svg`，并按当前实现重写 `README.md`。`docs/design/pool.md`
 - 2026-09-23 14:18 增加 `Config.Degrade`。池满时把当前运行任务交给它判断：返回 true 则另开协程直接执行，不占 `Size`；返回 false 则照旧排队。`pool.go` `coordinator.go` `pool_test.go` `docs/design/pool.md` `README.md`
 - 2026-09-23 14:10 `Submit` 增加 `sign` 参数，作为来源标记写入 `TaskInfo` 和 `Alert`，不参与调度。`pool.go` `coordinator.go` `alert.go` `executor.go` `pool_test.go` `docs/design/pool.md` `README.md`
 - 2026-09-23 14:02 删掉协调者里无人读取的 `goroutines`。`Idle`、`Running`、`Waiting` 改为从运行表和队列现算，不再另记一份。`coordinator.go` `alert.go`
@@ -28,6 +29,7 @@
 
 ## 最近验证
 
+- 2026-09-23 14:35 对照 `coordinator.go` 的接受、降级、finish、release 和 `alert.go` 的巡检，核对 `docs/flow.svg` 与 `README.md` 的分支一致。未改调度代码，未重跑测试。
 - 2026-09-23 14:18 `GOTOOLCHAIN=go1.27.1 go test -race -count=1 -timeout 180s ./...` 通过；`go vet ./...` 通过。池满且 `Degrade` 返回 true 时任务在池外执行；返回 false 时继续排队；有空槽位时不调用 `Degrade`。
 - 2026-09-23 14:10 `GOTOOLCHAIN=go1.27.1 go test -race -count=1 -timeout 180s ./...` 通过；`go vet ./...` 通过。运行中任务的 `Sign` 和告警的 `Sign` 与提交时一致。
 - 2026-09-23 14:02 `GOTOOLCHAIN=go1.27.1 go test -race -count=1 -timeout 180s ./...` 通过；`go vet ./...` 通过。计数改为现算后，快照不变量、优先级和告警仍然通过。
