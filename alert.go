@@ -53,6 +53,7 @@ func (st *sched) collectAlerts(now time.Time) []Alert {
 		st.alerted++
 		alerts = append(alerts, Alert{
 			TaskID:     job.id,
+			Sign:       job.sign,
 			Priority:   job.priority,
 			RunningFor: elapsed,
 			Idle:       idle,

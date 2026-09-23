@@ -56,7 +56,7 @@ func TestSubmitReturnsBeforeFnDone(t *testing.T) {
 	returned := make(chan struct{})
 	var ch <-chan loom.Result[int]
 	go func() {
-		ch = p.Submit(func() (int, error) {
+		ch = p.Submit("test", func() (int, error) {
 			close(entered)
 			<-release
 			return 7, nil
@@ -87,10 +87,10 @@ func TestSubmitReturnsBeforeFnDone(t *testing.T) {
 
 func TestUnreadResultDoesNotBlockWorker(t *testing.T) {
 	p := mustPool(t, loom.Config{Size: 1, OccupyThreshold: -1})
-	p.Submit(func() (int, error) {
+	p.Submit("test", func() (int, error) {
 		return 1, nil
 	})
-	ch := p.Submit(func() (int, error) {
+	ch := p.Submit("test", func() (int, error) {
 		time.Sleep(1 * time.Second)
 		return 2, nil
 	})
@@ -106,7 +106,7 @@ func TestPriorityOrder(t *testing.T) {
 	p := mustPool(t, loom.Config{Size: 1, OccupyThreshold: -1})
 	release := make(chan struct{})
 	entered := make(chan struct{})
-	hold := p.Submit(func() (int, error) {
+	hold := p.Submit("hold", func() (int, error) {
 		close(entered)
 		<-release
 		return 0, nil
@@ -115,7 +115,7 @@ func TestPriorityOrder(t *testing.T) {
 
 	order := make(chan int, 3)
 	submit := func(priority int) <-chan loom.Result[int] {
-		return p.Submit(func() (int, error) {
+		return p.Submit(fmt.Sprintf("p%d", priority), func() (int, error) {
 			order <- priority
 			return priority, nil
 		}, loom.WithPriority(priority))
@@ -133,7 +133,7 @@ func TestPriorityOrder(t *testing.T) {
 	if got.Snapshot.Idle != 0 || got.Snapshot.Waiting != 2 {
 		t.Fatalf("snapshot: %+v", got.Snapshot)
 	}
-	if len(got.Snapshot.RunningTasks) != 1 || got.Snapshot.RunningTasks[0].Priority != 10 {
+	if len(got.Snapshot.RunningTasks) != 1 || got.Snapshot.RunningTasks[0].Priority != 10 || got.Snapshot.RunningTasks[0].Sign != "p10" {
 		t.Fatalf("running: %+v", got.Snapshot.RunningTasks)
 	}
 	if got.Snapshot.RunningTasks[0].WaitingFor < 10*time.Millisecond {
@@ -166,7 +166,7 @@ func TestSamePriorityUsesTaskID(t *testing.T) {
 	p := mustPool(t, loom.Config{Size: 1, OccupyThreshold: -1})
 	release := make(chan struct{})
 	entered := make(chan struct{})
-	hold := p.Submit(func() (int, error) {
+	hold := p.Submit("test", func() (int, error) {
 		close(entered)
 		<-release
 		return 0, nil
@@ -175,7 +175,7 @@ func TestSamePriorityUsesTaskID(t *testing.T) {
 	order := make(chan int, 3)
 	for id := 1; id <= 3; id++ {
 		id := id
-		p.Submit(func() (int, error) {
+		p.Submit("test", func() (int, error) {
 			order <- id
 			return id, nil
 		})
@@ -195,18 +195,18 @@ func TestLastWithPriorityWins(t *testing.T) {
 	p := mustPool(t, loom.Config{Size: 1, OccupyThreshold: -1})
 	release := make(chan struct{})
 	entered := make(chan struct{})
-	hold := p.Submit(func() (string, error) {
+	hold := p.Submit("test", func() (string, error) {
 		close(entered)
 		<-release
 		return "", nil
 	})
 	<-entered
 	order := make(chan string, 2)
-	p.Submit(func() (int, error) {
+	p.Submit("test", func() (int, error) {
 		order <- "low"
 		return 0, nil
 	}, loom.WithPriority(9), nil, loom.WithPriority(1))
-	p.Submit(func() (int, error) {
+	p.Submit("test", func() (int, error) {
 		order <- "high"
 		return 0, nil
 	}, loom.WithPriority(4))
@@ -223,7 +223,7 @@ func TestLastWithPriorityWins(t *testing.T) {
 func TestFuncError(t *testing.T) {
 	p := mustPool(t, loom.Config{Size: 1, OccupyThreshold: -1})
 	sentinel := errors.New("biz")
-	got := recv(t, p.Submit(func() (int, error) { return 4, sentinel }))
+	got := recv(t, p.Submit("test", func() (int, error) { return 4, sentinel }))
 	if got.Value != 4 || got.Err != sentinel {
 		t.Fatalf("value=%d err=%v", got.Value, got.Err)
 	}
@@ -234,7 +234,7 @@ func TestFuncError(t *testing.T) {
 
 func TestPanicRecovered(t *testing.T) {
 	p := mustPool(t, loom.Config{Size: 1, OccupyThreshold: -1})
-	got := recv(t, p.Submit(func() (int, error) { panic("boom") }))
+	got := recv(t, p.Submit("test", func() (int, error) { panic("boom") }))
 	if got.Value != 0 || !errors.Is(got.Err, loom.ErrPanic) {
 		t.Fatalf("value=%d err=%v", got.Value, got.Err)
 	}
@@ -245,7 +245,7 @@ func TestPanicRecovered(t *testing.T) {
 	if got.Snapshot.Failed != 1 || got.Snapshot.Completed != 1 {
 		t.Fatalf("snapshot: %+v", got.Snapshot)
 	}
-	next := recv(t, p.Submit(func() (string, error) { return "next", nil }))
+	next := recv(t, p.Submit("test", func() (string, error) { return "next", nil }))
 	if next.Value != "next" || next.Err != nil {
 		t.Fatalf("value=%s err=%v", next.Value, next.Err)
 	}
@@ -253,18 +253,18 @@ func TestPanicRecovered(t *testing.T) {
 
 func TestNilRejectsDoNotTouchCounters(t *testing.T) {
 	p := mustPool(t, loom.Config{Size: 1, OccupyThreshold: -1})
-	base := recv(t, p.Submit(func() (int, error) { return 1, nil })).Snapshot
+	base := recv(t, p.Submit("test", func() (int, error) { return 1, nil })).Snapshot
 
-	ch := p.Submit[int](nil)
+	ch := p.Submit[int]("test", nil)
 	assertBuffered(t, ch, loom.ErrNilFunc)
 
-	after := recv(t, p.Submit(func() (int, error) { return 2, nil })).Snapshot
+	after := recv(t, p.Submit("test", func() (int, error) { return 2, nil })).Snapshot
 	if after.Submitted != base.Submitted+1 || after.Completed != base.Completed+1 || after.Failed != base.Failed {
 		t.Fatalf("base=%+v after=%+v", base, after)
 	}
 
-	assertBuffered(t, (*loom.Pool)(nil).Submit(func() (int, error) { return 1, nil }), loom.ErrNilPool)
-	assertBuffered(t, (*loom.Pool)(nil).Submit[int](nil), loom.ErrNilPool)
+	assertBuffered(t, (*loom.Pool)(nil).Submit("test", func() (int, error) { return 1, nil }), loom.ErrNilPool)
+	assertBuffered(t, (*loom.Pool)(nil).Submit[int]("test", nil), loom.ErrNilPool)
 }
 
 func assertBuffered[R comparable](t *testing.T, ch <-chan loom.Result[R], want error) {
@@ -306,13 +306,13 @@ func TestAlertWhileTaskStillRunning(t *testing.T) {
 		},
 	})
 	release := make(chan struct{})
-	ch := p.Submit(func() (string, error) {
+	ch := p.Submit("slow", func() (string, error) {
 		<-release
 		return "ok", nil
 	})
 	select {
 	case alert := <-alerts:
-		if alert.TaskID == 0 || alert.Running < 1 || alert.RunningFor < threshold {
+		if alert.TaskID == 0 || alert.Sign != "slow" || alert.Running < 1 || alert.RunningFor < threshold {
 			t.Fatalf("alert: %+v", alert)
 		}
 	case <-time.After(2 * time.Second):
@@ -335,7 +335,7 @@ func TestShortTaskCanSkipAlert(t *testing.T) {
 		OccupyThreshold: time.Second,
 		OnAlert:         func(loom.Alert) { calls.Add(1) },
 	})
-	recv(t, p.Submit(func() (int, error) { return 1, nil }))
+	recv(t, p.Submit("test", func() (int, error) { return 1, nil }))
 	time.Sleep(40 * time.Millisecond)
 	if calls.Load() != 0 {
 		t.Fatalf("calls=%d", calls.Load())
@@ -344,7 +344,7 @@ func TestShortTaskCanSkipAlert(t *testing.T) {
 
 func TestNilOnAlertStillCounts(t *testing.T) {
 	p := mustPool(t, loom.Config{Size: 1, OccupyThreshold: 20 * time.Millisecond})
-	got := recv(t, p.Submit(func() (int, error) {
+	got := recv(t, p.Submit("test", func() (int, error) {
 		time.Sleep(120 * time.Millisecond)
 		return 1, nil
 	}))
@@ -374,7 +374,7 @@ func TestAlertMergesSkippedPeriods(t *testing.T) {
 		},
 	})
 	releaseTask := make(chan struct{})
-	ch := p.Submit(func() (int, error) {
+	ch := p.Submit("test", func() (int, error) {
 		<-releaseTask
 		return 1, nil
 	})
@@ -425,8 +425,8 @@ func TestOnAlertPanicContinues(t *testing.T) {
 		<-release
 		return 1, nil
 	}
-	p.Submit(fn)
-	p.Submit(fn)
+	p.Submit("test", fn)
+	p.Submit("test", fn)
 	<-entered
 	<-entered
 	select {
@@ -448,7 +448,7 @@ func TestConcurrencyCap(t *testing.T) {
 	for range n {
 		go func() {
 			defer wg.Done()
-			ch := p.Submit(func() (int, error) {
+			ch := p.Submit("test", func() (int, error) {
 				c := cur.Add(1)
 				for {
 					old := maxSeen.Load()
@@ -485,7 +485,7 @@ func TestConcurrentSubmit(t *testing.T) {
 	for i := range n {
 		go func() {
 			defer wg.Done()
-			ch := p.Submit(func() (int, error) {
+			ch := p.Submit("test", func() (int, error) {
 				return i, nil
 			}, loom.WithPriority(i%5-2))
 			select {

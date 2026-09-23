@@ -71,8 +71,9 @@ func New(cfg Config) (*Pool, error) {
 }
 
 // Submit 接受 fn 并立刻返回 channel。R 由 fn 推断。
+// sign 是来源标记，原样记在运行中的任务和告警上，不参与调度。空字符串允许。
 // channel 容量为 1，终态后送出一次 Result 并关闭。没人接收也不会堵住任务协程。
-func (p *Pool) Submit[R any](fn func() (R, error), opts ...Option) <-chan Result[R] {
+func (p *Pool) Submit[R any](sign string, fn func() (R, error), opts ...Option) <-chan Result[R] {
 	ch := make(chan Result[R], 1)
 	if p == nil {
 		deliverNow(ch, Result[R]{Err: ErrNilPool})
@@ -91,7 +92,7 @@ func (p *Pool) Submit[R any](fn func() (R, error), opts ...Option) <-chan Result
 	}
 
 	var value R
-	job := &task{priority: priority}
+	job := &task{sign: sign, priority: priority}
 	job.exec = func() {
 		defer func() {
 			if rec := recover(); rec != nil {
@@ -155,6 +156,7 @@ type PriorityCount struct {
 // TaskInfo 描述一个已标成 Running、尚未终态的任务。
 type TaskInfo struct {
 	ID         uint64
+	Sign       string
 	Priority   int
 	WaitingFor time.Duration
 	RunningFor time.Duration
@@ -164,6 +166,7 @@ type TaskInfo struct {
 // Alert 是一次占用告警，描述决定发出它的那一刻。
 type Alert struct {
 	TaskID     uint64
+	Sign       string
 	Priority   int
 	RunningFor time.Duration
 	Idle       int

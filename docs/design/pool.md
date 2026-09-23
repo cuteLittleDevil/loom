@@ -56,13 +56,15 @@ if err != nil {
 `Submit` 是具体方法，类型参数写在方法上。Go 1.27 起具体方法可以声明自己的类型参数；接口方法仍然不行。见 [Go 博客：Generic Methods](https://go.dev/blog/generic-methods) 。因此一个非泛型的 `Pool` 可以提交不同的 `R`，但这个方法不能用来实现接口。
 
 ```go
-func (p *Pool) Submit[R any](fn func() (R, error), opts ...Option) <-chan Result[R]
+func (p *Pool) Submit[R any](sign string, fn func() (R, error), opts ...Option) <-chan Result[R]
 ```
+
+`sign` 是这次提交的来源标记，原样保存，不参与优先级和 ID 排序。空字符串允许。运行中的任务在 `TaskInfo.Sign` 里能看到它，告警在 `Alert.Sign` 里能看到它。
 
 返回值是 `R` 能从 `fn` 推断出来的 channel，调用方通常不必写出 `[R]`。
 
 ```go
-ch := p.Submit(func() (User, error) {
+ch := p.Submit("user-api", func() (User, error) {
     return fetchUser(id)
 })
 got := <-ch
@@ -76,7 +78,7 @@ if got.Err != nil {
 未传优先级时，优先级是 0。更高的 `int` 先执行，负数低于默认优先级。多个 `WithPriority` 同时出现时，最后一个生效。`opts` 里的 nil 项忽略。不限制优先级的取值范围。
 
 ```go
-ch := p.Submit(func() (Report, error) {
+ch := p.Submit("report", func() (Report, error) {
     return buildReport()
 }, loom.WithPriority(10))
 ```
@@ -141,6 +143,7 @@ type PriorityCount struct {
 
 type TaskInfo struct {
     ID         uint64
+    Sign       string
     Priority   int
     WaitingFor time.Duration // 从接受到标成 Running，之后不再增加
     RunningFor time.Duration // 从标成 Running 到采集快照，是观察值
@@ -222,6 +225,7 @@ var (
 ```go
 type Alert struct {
     TaskID     uint64
+    Sign       string
     Priority   int
     RunningFor time.Duration
     Idle       int
@@ -301,7 +305,7 @@ type Alert struct {
 
 仓库还没有池子的调用方，这次设计是纯增量。实现要求 Go 1.27 或更新，因为 `Submit` 是带类型参数的具体方法。接口方法不能声明类型参数，不能把 `Submit` 写进接口。
 
-之后若给 `Snapshot`、`Alert`、`Result` 或 `PanicError` 增加字段，按字段名写的复合字面量仍能编译。不要把字段顺序当成承诺。`Submit` 的形状 `(fn func() (R, error), opts ...Option) <-chan Result[R]` 视为稳定。`Result` 的字段名 `Value`、`Snapshot`、`Err` 视为稳定。channel 恰好送出一次然后关闭，视为稳定。优先级的排序规则视为稳定：数值更大的先执行，同数值按任务 ID 从小到大。错误身份以哨兵为准，不以错误字符串为准。panic 的原始值以 `PanicError.Value` 为准。
+之后若给 `Snapshot`、`Alert`、`Result` 或 `PanicError` 增加字段，按字段名写的复合字面量仍能编译。不要把字段顺序当成承诺。`Submit` 的形状 `(sign string, fn func() (R, error), opts ...Option) <-chan Result[R]` 视为稳定。`TaskInfo.Sign` 和 `Alert.Sign` 是提交时的来源标记。`Result` 的字段名 `Value`、`Snapshot`、`Err` 视为稳定。channel 恰好送出一次然后关闭，视为稳定。优先级的排序规则视为稳定：数值更大的先执行，同数值按任务 ID 从小到大。错误身份以哨兵为准，不以错误字符串为准。panic 的原始值以 `PanicError.Value` 为准。
 
 使用上的代价需要直接接受：
 
@@ -356,7 +360,7 @@ type Alert struct {
 ### 为什么 Submit 是方法
 
 ```go
-func (p *Pool) Submit[R any](fn func() (R, error), opts ...Option) <-chan Result[R]
+func (p *Pool) Submit[R any](sign string, fn func() (R, error), opts ...Option) <-chan Result[R]
 ```
 
 Go 1.27 允许具体方法声明类型参数，所以 `R` 不必再抬到包级函数上，也不必把池子做成 `Pool[R]`。做成 `Pool[R]` 会让一个池子只能执行一种返回类型。接口方法仍然不能声明类型参数，这个 `Submit` 不能出现在接口里。依据是 Go 1.27 的语言说明和 [Generic Methods](https://go.dev/blog/generic-methods) （2026-08-26）。

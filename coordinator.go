@@ -170,6 +170,7 @@ func (st *sched) snapshot(now time.Time) Snapshot {
 		for i, job := range jobs {
 			snap.RunningTasks[i] = TaskInfo{
 				ID:         job.id,
+				Sign:       job.sign,
 				Priority:   job.priority,
 				WaitingFor: job.waitingFor,
 				RunningFor: now.Sub(job.started),

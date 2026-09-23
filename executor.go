@@ -5,6 +5,7 @@ import "time"
 // task 是一次已接受的提交。exec 与 deliver 由 Submit 按 R 闭包填充。
 type task struct {
 	id         uint64
+	sign       string
 	priority   int
 	accepted   time.Time
 	started    time.Time

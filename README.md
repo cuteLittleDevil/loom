@@ -10,7 +10,7 @@ if err != nil {
     return err
 }
 
-ch := p.Submit(func() (string, error) {
+ch := p.Submit("billing", func() (string, error) {
     return "ok", nil
 })
 got := <-ch
