@@ -6,16 +6,23 @@
 
 ## 流程
 
-![loom 提交与调度流程](docs/flow.svg)
+整体只有三条出路。有空位就进池内；池满且 `Degrade` 返回 true 就在池外执行；否则排队。巡检不参与这三条路。
 
-图分四段：
+```mermaid
+flowchart TD
+  Submit["Submit：立刻返回 channel"] --> Coord["协调者串行接受"]
+  Coord --> Free{"有空闲槽位?"}
+  Free -->|有| Run["池内执行"]
+  Free -->|无| Deg{"Degrade 返回 true?"}
+  Deg -->|是| Out["池外执行，不占 Size"]
+  Deg -->|否| Queue["优先级队列"]
+  Queue --> Run
+  Run --> Result["终态后送出一次 Result"]
+  Out --> Result
+  Inspect["巡检与任务并行"] -.-> Run
+```
 
-1. `Submit` 做 nil 检查。通过后把接受操作放进容量 100 的缓冲，然后立刻返回 channel。缓冲满了才另开一条协程去发送。
-2. 协调者串行分配 ID。有空闲槽位就标成 `Running` 并启动一条任务协程。没有空位时，若设置了 `Degrade`，把当前运行任务交给它判断；返回 true 就在池外直接执行，否则进入优先级队列。
-3. 池内任务执行完后回到协调者记终态、复制快照，再送出一次 `Result`。下一个用户函数要等这次结果送出后才启动。
-4. 告警阈值大于等于 0 时，巡检与任务并行。它只通知，不取消任务，也不改优先级。
-
-不变量和取舍见 [docs/design/pool.md](docs/design/pool.md) 。
+各段执行见 [docs/flow.md](docs/flow.md) 。不变量和取舍见 [docs/design/pool.md](docs/design/pool.md) 。
 
 ## 例子
 

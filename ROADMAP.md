@@ -14,6 +14,8 @@
 
 ## 最近完成
 
+- 2026-09-24 12:29 README 只保留三条出路的总图，`Submit`、协调者、池内终态、池外执行和巡检挪到 `docs/flow.md`，README 与设计文档链到该文件。`README.md` `docs/flow.md` `docs/design/pool.md`
+- 2026-09-24 12:24 README 的流程改为 5 张 Mermaid 图：整体、`Submit`、协调者、池内终态与池外执行、巡检。设计文档改为指向该节。`README.md` `docs/design/pool.md`
 - 2026-09-23 14:49 README 使用示例补上 `Size`、告警、`Degrade`、`sign` 和 `loom.Result` 的注释。`README.md`
 - 2026-09-23 14:48 README 使用示例改为提交自定义结构体 `Result{Name}`，`got.Value` 即该结构体。`README.md`
 - 2026-09-23 14:42 例子、README 和设计文档里的日志改为 `log/slog`。`example/` `README.md` `docs/design/pool.md` `pool_test.go`
@@ -33,6 +35,8 @@
 
 ## 最近验证
 
+- 2026-09-24 12:29 核对 README 只保留总图并链接 `docs/flow.md`，四张详情图只出现在 `docs/flow.md`，设计文档指向这两处。图的分支沿用 12:24 的对照，未改调度代码，未重跑测试。
+- 2026-09-24 12:24 对照 `pool.go` 的 `Submit` 与 `New`、`coordinator.go` 的 accept、降级、finish、release，以及 `alert.go` 的巡检，核对 README 中 5 张 Mermaid 图的分支。未改调度代码，未重跑测试。
 - 2026-09-23 14:49 README 示例只增加注释，未改可执行语句，沿用 14:48 的 `go run` 结果。
 - 2026-09-23 14:48 将 README 使用示例抽到临时模块 `go run`，输出 `result name=ok`。
 - 2026-09-23 14:42 四个 example 改为 `slog` 后重新 `go run`，分别打出 result、order `[10 5 1]`、degraded、alert。`go test -count=1 -run TestUnreadResultDoesNotBlockWorker` 通过。
